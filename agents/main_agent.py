@@ -25,7 +25,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from project root
 
-from deepagents import create_deep_agent          # pip install deepagents
+from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
+
+from langchain_core.messages import AIMessage
 
 # ── Import all tools ──────────────────────────────────────────────────────────
 from tools.fssai.fssai_tools     import FSSAI_TOOLS
@@ -59,10 +62,10 @@ not the legal company name.
 Steps:
 1. Call fssai_search(brand_name) using the BRAND NAME from the user query
 2. Call fssai_parse(html) to extract structured license records
-3. Return the list of records — never hallucinate
+3. Return the list of records as JSON — never hallucinate
 
-If nothing is found, return [].
-Always read your skill file first: ./skills/fssai-scraper/SKILL.md
+If nothing is found, return {"records": [], "source": "fssai", "status": "no_results"}.
+If a tool errors, return {"records": [], "source": "fssai", "status": "error", "error": "<msg>"}.
 """,
     "tools":  FSSAI_TOOLS,
     "skills": ["./skills/fssai-scraper/"],
@@ -78,19 +81,14 @@ mca_agent = {
     "system_prompt": """
 You are the MCA Company Agent. You find company registration data from MCA and Tofler.
 
-IMPORTANT — use the right search term:
-  - mca_search(company_name, brand_name)   → searches MCA with BOTH legal name AND brand name
-  - get_branch_offices(company_name, brand_name) → finds branch offices via Tofler using BOTH names
-
 Steps:
-1. Extract company_name  (legal entity, e.g. "GUJARAT CO-OP MILK MARKETING FEDERATION LTD.")
-   and brand_name (consumer name, e.g. "AMUL") from the query
-2. Call mca_search(company_name, brand_name)
-3. Call get_branch_offices(company_name, brand_name)
-4. Combine HQ + Branch records; deduplicate by (name, city)
-5. Return only Active, India-based locations
+1. Call mca_search(company_name, brand_name) — searches MCA with BOTH identifiers
+2. Call get_branch_offices(company_name, brand_name) — finds branches via Tofler
+3. Combine and deduplicate records by (name, city)
+4. Return only Active, India-based locations as JSON
 
-Only return Active companies. Read skill: ./skills/mca-company/SKILL.md
+If tools fail, return {"records": [], "source": "mca", "status": "error", "error": "<msg>"}.
+Only return Active companies.
 """,
     "tools":  MCA_TOOLS,
     "skills": ["./skills/mca-company/"],
@@ -105,16 +103,16 @@ ecommerce_agent = {
     "system_prompt": """
 You are the E-commerce Agent. You check if a food brand is available online in India.
 
-Use the BRAND NAME (consumer-facing, e.g. "AMUL") for all searches — not the company name.
+Use the BRAND NAME (consumer-facing, e.g. "AMUL") for all searches.
 
 Steps:
 1. Get city list: get_cities_list()
 2. For each city, check all 3 platforms: ecomm_check(platform, city, brand_name)
    - platforms: "swiggy", "blinkit", "amazon"
 3. Build city_summary: {city: {available_on: [...], score: N/3}}
-4. Return platform_results + city_summary
+4. Return {"platform_results": [...], "city_summary": {...}, "source": "ecommerce"}
 
-Check all 3 platforms for every city. Read skill: ./skills/ecommerce/SKILL.md
+If a platform check errors, record it as not found for that city/platform and continue.
 """,
     "tools":  ECOMM_TOOLS,
     "skills": ["./skills/ecommerce/"],
@@ -136,9 +134,10 @@ Steps:
 2. Call justdial_search(brand_name, city) for key cities
 3. Call indiamart_search(brand_name) for wholesale distributors
 4. Cross-verify: same city appears in 2+ sources → set verified=True
-5. Return distributors list + state_coverage summary
+5. Return {"distributors": [...], "state_coverage": {...}, "source": "maps"}
 
-All results must be India-only. Read skill: ./skills/web-maps/SKILL.md
+If a search errors, skip that city/source and continue with others.
+All results must be India-only.
 """,
     "tools":  MAPS_TOOLS,
     "skills": ["./skills/web-maps/"],
@@ -157,11 +156,10 @@ Steps:
 1. Receive merged data dict from orchestrator
 2. Call build_excel(data, brand_name) to create the Excel file
 3. Call build_heatmap(state_scores) to generate heatmap JSON
-4. Return excel_path + heatmap_data + summary stats
+4. Return {"excel_path": "...", "heatmap": {...}, "status": "success"}
 
 The report must include both company-level data (MCA/branches) and
 brand-level data (FSSAI licenses, e-commerce, distributors).
-Read skill: ./skills/report-builder/SKILL.md
 """,
     "tools":  REPORT_TOOLS,
     "skills": ["./skills/report-builder/"],
@@ -184,7 +182,7 @@ Always pass BOTH identifiers to every sub-agent so each uses the right one.
 
 Your workflow:
 1. Parse company_name and brand_name from user input
-2. Dispatch ALL 4 data agents in parallel, passing both names clearly:
+2. Dispatch ALL 4 data agents using the task tool, passing both names clearly:
    - fssai_scraper     → searches by BRAND NAME → government food license data
    - mca_company       → searches by COMPANY NAME (+ brand fallback) → corporate data
    - ecommerce_checker → searches by BRAND NAME → online availability data
@@ -198,26 +196,27 @@ Your workflow:
      "cities":   {"Maharashtra": ["Mumbai", "Pune"], ...},
      "sources":  {
        "fssai":      [...],
-       "mca":        [...],      ← includes both HQ and all branch offices
+       "mca":        [...],
        "ecommerce":  {...},
        "maps":       [...]
      },
-     "confidence": 0.0–1.0
+     "confidence": 0.0-1.0
    }
 5. Calculate confidence = (sources that returned data) / 4
-6. Dispatch report_builder with the merged data
-7. Return the full summary to the user
+6. Call the report_builder agent with the merged data
+7. Return the full summary as plain text to the user
 
 All results must be INDIA ONLY — discard any foreign locations.
-Always read your skill: ./skills/main/SKILL.md
 """
 
 
 def build_agent(model: str):
     """Build and return the complete multi-agent system."""
+    backend = FilesystemBackend(root_dir=Path.cwd())
     return create_deep_agent(
         model=model,
         system_prompt=ORCHESTRATOR_PROMPT,
+        backend=backend,
         skills=["./skills/main/"],
         subagents=[
             fssai_agent,
@@ -230,6 +229,39 @@ def build_agent(model: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_text(msg: AIMessage) -> str:
+    """Extract plain text from an AIMessage regardless of content format."""
+    raw = msg.content
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, list):
+        parts = []
+        for block in raw:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(p for p in parts if p).strip()
+    return ""
+
+
+def _token_summary(messages: list) -> tuple[int, int, int]:
+    """Sum token usage across all messages."""
+    total_in = total_out = total = 0
+    for msg in messages:
+        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+            m = msg.usage_metadata
+            total_in  += m.get("input_tokens",  0)
+            total_out += m.get("output_tokens", 0)
+            total     += m.get("total_tokens",  0)
+    return total, total_in, total_out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CLI RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -237,9 +269,9 @@ async def run(company: str, brand: str, model: str):
     agent = build_agent(model)
 
     print(f"\n{'='*60}")
-    print(f"  🏭  Company : {company}")
-    print(f"  🍱  Brand   : {brand}")
-    print(f"  🤖  Model   : {model}")
+    print(f"  Company : {company}")
+    print(f"  Brand   : {brand}")
+    print(f"  Model   : {model}")
     print(f"{'='*60}\n")
 
     query = (
@@ -251,10 +283,51 @@ async def run(company: str, brand: str, model: str):
         f"All results must be India only."
     )
 
-    result = await agent.run(query)
+    try:
+        state = await agent.ainvoke({"messages": [("user", query)]})
+    except Exception as exc:
+        print(f"\n[ERROR] Agent invocation failed: {exc}")
+        raise
+
+    messages = state.get("messages", [])
+
+    # ── Debug: print message trace ───────────────────────────────────────────
+    print("\n--- MESSAGE TRACE ---")
+    for i, msg in enumerate(messages):
+        preview = str(msg.content)[:200]
+        tc_count = len(getattr(msg, "tool_calls", []))
+        tag = f" [{tc_count} tool_calls]" if tc_count else ""
+        print(f"  [{i}] {type(msg).__name__}{tag}: {preview!r}")
+    print("---------------------")
+
+    # ── Extract last meaningful AIMessage text ───────────────────────────────
+    result = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            text = _extract_text(msg)
+            if text:
+                result = text
+                break
+
+    # ── Token usage ──────────────────────────────────────────────────────────
+    total, total_in, total_out = _token_summary(messages)
+    token_summary = f"Total: {total} (Input: {total_in}, Output: {total_out})"
 
     print("\n✅  Research Complete!")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print("\n--- OUTPUT ---")
+    print(result if result else "[No text output — check MESSAGE TRACE above]")
+    print("\n--- TOKEN USAGE ---")
+    print(token_summary)
+
+    # ── Log to file ──────────────────────────────────────────────────────────
+    log_path = Path("agent_execution.log")
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n{'='*50}\n")
+        f.write(f"Company: {company} | Brand: {brand} | Model: {model}\n")
+        f.write(f"Tokens: {token_summary}\n")
+        f.write(f"Output:\n{result}\n")
+        f.write(f"{'='*50}\n")
+
     return result
 
 
@@ -266,13 +339,13 @@ def main():
             "Examples:\n"
             '  python main.py --company "GUJARAT CO-OP MILK MARKETING FEDERATION LTD." --brand "AMUL"\n'
             '  python main.py --company "Haldiram Foods International Pvt Ltd" --brand "Haldirams"\n'
-            '  python main.py --brand "Parle-G"   # company defaults to brand if omitted\n'
+            '  python main.py --brand "Parle-G"\n'
         ),
     )
     parser.add_argument(
         "--company",
         default="",
-        help="Legal registered company name (e.g. 'GUJARAT CO-OP MILK MARKETING FEDERATION LTD.')",
+        help="Legal registered company name",
     )
     parser.add_argument(
         "--brand",
@@ -282,13 +355,11 @@ def main():
     parser.add_argument(
         "--model",
         default="google_genai:gemini-2.0-flash",
-        help="LLM model to use (default: google_genai:gemini-2.0-flash)",
+        help="LLM model (default: google_genai:gemini-2.0-flash)",
     )
     args = parser.parse_args()
 
-    # If company not given, fall back to brand name
     company = args.company.strip() if args.company.strip() else args.brand.strip()
-
     asyncio.run(run(company=company, brand=args.brand.strip(), model=args.model))
 
 
