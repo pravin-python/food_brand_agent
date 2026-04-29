@@ -1,21 +1,29 @@
 """
 tools/fssai/fssai_tools.py
-FSSAI FOSCOS portal scraper tools for the FSSAI Scraper Agent
+FSSAI FOSCOS portal scraper tools for the FSSAI Scraper Agent.
+Uses requests + BeautifulSoup (async-safe; no sync_playwright in async context).
 """
 
 import time
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 from typing import Optional
 
 
-FSSAI_URL = "https://foscos.fssai.gov.in/index.php/licensee-search"
+FSSAI_SEARCH_URL = "https://foscos.fssai.gov.in/index.php/licensee-search"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://foscos.fssai.gov.in/",
+}
 
 
-def fssai_search(brand_name: str, max_retries: int = 2) -> str:
+def fssai_search(brand_name: str, max_retries: int = 3) -> str:
     """
-    Search FSSAI FOSCOS portal for a brand name.
+    Search FSSAI FOSCOS portal for a brand name using HTTP POST.
     Returns raw HTML of results table.
 
     Args:
@@ -23,36 +31,31 @@ def fssai_search(brand_name: str, max_retries: int = 2) -> str:
         max_retries: Number of retries on failure
 
     Returns:
-        HTML string of results table, or empty string if not found
+        HTML string of results table, or error string on failure
     """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     for attempt in range(max_retries):
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(FSSAI_URL, timeout=30000)
+            # First GET to get any CSRF token / session cookie
+            session.get(FSSAI_SEARCH_URL, timeout=20)
 
-                # Fill search form
-                page.fill('input[name="business_name"]', brand_name)
-                page.click('button[type="submit"]')
-                page.wait_for_selector("table", timeout=15000)
-
-                # Collect all pages
-                all_html = []
-                while True:
-                    all_html.append(page.content())
-                    next_btn = page.query_selector("a:text('Next')")
-                    if not next_btn:
-                        break
-                    next_btn.click()
-                    page.wait_for_load_state("networkidle")
-
-                browser.close()
-                return "\n".join(all_html)
+            # POST the search form
+            payload = {
+                "business_name": brand_name,
+                "state":         "",
+                "district":      "",
+                "license_type":  "",
+                "submit":        "Search",
+            }
+            resp = session.post(FSSAI_SEARCH_URL, data=payload, timeout=20)
+            resp.raise_for_status()
+            return resp.text
 
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(5)
+                time.sleep(3)
             else:
                 return f"ERROR:{str(e)}"
 
@@ -100,7 +103,6 @@ def _extract_city(address: str) -> str:
     if not address:
         return ""
     parts = [p.strip() for p in address.split(",")]
-    # City is usually 2nd or 3rd last part
     if len(parts) >= 3:
         return parts[-3]
     elif len(parts) >= 2:

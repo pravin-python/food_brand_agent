@@ -251,10 +251,64 @@ async def run(company: str, brand: str, model: str):
         f"All results must be India only."
     )
 
-    result = await agent.run(query)
+    state = await agent.ainvoke({"messages": [("user", query)]})
+
+    # ── DEBUG: print all messages to understand what graph returned ─────────
+    print("\n--- MESSAGE TRACE ---")
+    for i, msg in enumerate(state.get("messages", [])):
+        msg_type = type(msg).__name__
+        raw = msg.content
+        preview = str(raw)[:150]
+        print(f"  [{i}] {msg_type}: {preview!r}")
+    print("---------------------")
+
+    # ── Find the last AIMessage that has actual text content ─────────────────
+    from langchain_core.messages import AIMessage
+    result = ""
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, AIMessage):
+            raw = msg.content
+            if isinstance(raw, list):
+                text = "\n".join(
+                    block.get("text", "") for block in raw
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                text = str(raw) if raw else ""
+            if text.strip():
+                result = text
+                break
+
+    # ── Token usage ──────────────────────────────────────────────────────────
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tokens = 0
+    for msg in state.get("messages", []):
+        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+            meta = msg.usage_metadata
+            total_input_tokens  += meta.get("input_tokens",  0)
+            total_output_tokens += meta.get("output_tokens", 0)
+            total_tokens        += meta.get("total_tokens",  0)
+
+    token_summary = (
+        f"Total Tokens: {total_tokens} "
+        f"(Input: {total_input_tokens}, Output: {total_output_tokens})"
+    )
 
     print("\n✅  Research Complete!")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print("\n--- OUTPUT ---")
+    print(result if result else "[Empty Output — see MESSAGE TRACE above]")
+    print("\n--- TOKEN USAGE ---")
+    print(token_summary)
+
+    # ── Log to file ──────────────────────────────────────────────────────────
+    with open("agent_execution.log", "a", encoding="utf-8") as log_file:
+        log_file.write(f"\n{'='*50}\n")
+        log_file.write(f"Company: {company} | Brand: {brand}\n")
+        log_file.write(f"Tokens: {token_summary}\n")
+        log_file.write(f"Output:\n{result}\n")
+        log_file.write(f"{'='*50}\n")
+
     return result
 
 
@@ -281,8 +335,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="google_genai:gemini-2.0-flash",
-        help="LLM model to use (default: google_genai:gemini-2.0-flash)",
+        default="google_genai:gemini-2.5-flash",
+        help="LLM model to use (default: google_genai:gemini-2.5-flash)",
     )
     args = parser.parse_args()
 

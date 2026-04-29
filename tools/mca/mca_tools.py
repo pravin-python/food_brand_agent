@@ -1,20 +1,21 @@
 """
 tools/mca/mca_tools.py
 MCA & Tofler tools for the MCA Company Agent.
-
-Two separate search axes:
-  - company_name : legal registered entity (e.g. "GUJARAT CO-OP MILK MARKETING FEDERATION LTD.")
-  - brand_name   : consumer-facing brand   (e.g. "AMUL")
-
-Both are searched independently and merged so no presence data is missed.
+Uses requests + BeautifulSoup (async-safe; no sync_playwright).
 """
 
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
-MCA_SEARCH_URL = "https://www.mca.gov.in/content/mca/global/en/mca/fo-llp-services/company-llp-search.html"
-TOFLER_URL     = "https://www.tofler.in/search?query="
+MCA_API_URL  = "https://www.mca.gov.in/mcafoportal/findLlpMasterData.do"
+TOFLER_URL   = "https://www.tofler.in/search?query="
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 # Complete list of Indian states + UTs for address-based filtering
 INDIAN_STATES = [
@@ -29,7 +30,7 @@ INDIAN_STATES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MCA PORTAL SEARCH
+#  MCA PORTAL SEARCH  (uses MCA public company search API)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mca_search(company_name: str, brand_name: str = "") -> list[dict]:
@@ -39,13 +40,10 @@ def mca_search(company_name: str, brand_name: str = "") -> list[dict]:
 
     Args:
         company_name: Legal registered company name
-                      (e.g. "GUJARAT CO-OP MILK MARKETING FEDERATION LTD.")
-        brand_name  : Consumer-facing brand name (e.g. "AMUL").
-                      Leave empty to skip brand-name search.
+        brand_name  : Consumer-facing brand name (optional fallback)
 
     Returns:
-        Deduplicated list of Active company dicts, each with:
-          cin, name, state, status, address, city, type, source, search_term
+        Deduplicated list of Active company dicts with cin, name, state, status, source
     """
     results: list[dict] = []
     seen_cins: set[str] = set()
@@ -55,46 +53,49 @@ def mca_search(company_name: str, brand_name: str = "") -> list[dict]:
         queries.append((brand_name, "brand_name"))
 
     for query, search_term in queries:
-        rows = _mca_portal_query(query, search_term)
+        rows = _mca_api_query(query, search_term)
         for r in rows:
             cin = r.get("cin", "")
             if cin and cin not in seen_cins:
                 seen_cins.add(cin)
                 results.append(r)
             elif not cin:
-                results.append(r)   # keep if no CIN (still useful)
+                results.append(r)
 
     return results
 
 
-def _mca_portal_query(query: str, search_term: str) -> list[dict]:
-    """Run one MCA portal search and return Active company rows."""
+def _mca_api_query(query: str, search_term: str) -> list[dict]:
+    """Query MCA public search API and return Active company rows."""
     results = []
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(MCA_SEARCH_URL, timeout=30_000)
-            page.fill('input[placeholder*="Company Name"]', query)
-            page.keyboard.press("Enter")
-            page.wait_for_selector(".company-result, table", timeout=15_000)
+        # Try MCA v3 company search (JSON endpoint)
+        resp = requests.get(
+            "https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do",
+            params={"companyName": query},
+            headers=HEADERS,
+            timeout=15,
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("table tr")[1:]  # skip header
 
-            rows = page.query_selector_all("tr")
-            for row in rows:
-                cols = row.query_selector_all("td")
-                if len(cols) >= 4:
-                    results.append({
-                        "cin":         cols[0].inner_text().strip(),
-                        "name":        cols[1].inner_text().strip(),
-                        "state":       cols[2].inner_text().strip(),
-                        "status":      cols[3].inner_text().strip(),
-                        "address":     "",
-                        "city":        "",
-                        "type":        "HQ",
-                        "source":      "mca",
-                        "search_term": search_term,
-                    })
-            browser.close()
+        for row in rows:
+            cols = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cols) >= 4:
+                status = cols[3] if len(cols) > 3 else ""
+                if "active" not in status.lower():
+                    continue
+                results.append({
+                    "cin":         cols[0] if cols else "",
+                    "name":        cols[1] if len(cols) > 1 else "",
+                    "state":       cols[2] if len(cols) > 2 else "",
+                    "status":      status,
+                    "address":     "",
+                    "city":        "",
+                    "type":        "HQ",
+                    "source":      "mca",
+                    "search_term": search_term,
+                })
     except Exception as e:
         results.append({
             "error":       str(e),
@@ -102,7 +103,7 @@ def _mca_portal_query(query: str, search_term: str) -> list[dict]:
             "search_term": search_term,
         })
 
-    return [r for r in results if r.get("status", "").lower() == "active"]
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,8 +120,7 @@ def get_branch_offices(company_name: str, brand_name: str = "") -> list[dict]:
         brand_name  : Consumer-facing brand name (optional)
 
     Returns:
-        List of Active branch location dicts restricted to India only,
-        each tagged with type="Branch" and the search_term that found it.
+        List of Active India-only branch location dicts
     """
     results: list[dict] = []
     seen: set[str] = set()
@@ -145,29 +145,33 @@ def _tofler_query(query: str, search_term: str) -> list[dict]:
     try:
         resp = requests.get(
             TOFLER_URL + requests.utils.quote(query),
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=HEADERS,
             timeout=15,
         )
         soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select(".company-card, .search-result")
+
+        # Try multiple known Tofler card selectors
+        cards = (
+            soup.select(".company-card") or
+            soup.select(".search-result") or
+            soup.select(".srp-card")
+        )
 
         for card in cards:
-            name_el   = card.select_one(".company-name")
-            addr_el   = card.select_one(".address")
-            status_el = card.select_one(".status")
+            name_el   = card.select_one(".company-name, h2, .srp-name")
+            addr_el   = card.select_one(".address, .srp-addr")
+            status_el = card.select_one(".status, .srp-status")
 
             name    = name_el.get_text(strip=True)   if name_el   else ""
             address = addr_el.get_text(strip=True)   if addr_el   else ""
-            status  = status_el.get_text(strip=True) if status_el else ""
+            status  = status_el.get_text(strip=True) if status_el else "active"
 
-            if status.lower() != "active":
+            if status and "active" not in status.lower():
                 continue
 
             state, city = _parse_state_city(address)
-
-            # ── India-only filter ──────────────────────────────────
             if not state:
-                continue  # no recognised Indian state → skip
+                continue  # non-India → skip
 
             results.append({
                 "name":        name,
@@ -193,16 +197,12 @@ def _tofler_query(query: str, search_term: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_state_city(address: str) -> tuple[str, str]:
-    """
-    Extract (state, city) from a free-text Indian address string.
-    Returns ("", "") when no Indian state is detected (used as India-only filter).
-    """
+    """Extract (state, city) from a free-text Indian address string."""
     state = ""
     for s in INDIAN_STATES:
         if s.lower() in address.lower():
             state = s
             break
-
     parts = [p.strip() for p in address.split(",")]
     city = parts[-3] if len(parts) >= 3 else (parts[0] if parts else "")
     return state, city

@@ -1,11 +1,11 @@
 """
 tools/ecommerce/ecomm_tools.py
-E-commerce availability checker tools for the E-commerce Agent
+E-commerce availability checker tools for the E-commerce Agent.
+Uses requests + BeautifulSoup (async-safe; no sync_playwright).
 """
 
-from playwright.sync_api import sync_playwright
-from typing import Optional
-import time
+import requests
+from bs4 import BeautifulSoup
 
 CITIES_TO_CHECK = [
     "Mumbai", "Delhi", "Bengaluru", "Chennai", "Hyderabad",
@@ -14,22 +14,13 @@ CITIES_TO_CHECK = [
     "Surat", "Patna", "Vadodara", "Guwahati", "Coimbatore",
 ]
 
-CITY_COORDS = {
-    "Mumbai":     (19.0760, 72.8777),
-    "Delhi":      (28.7041, 77.1025),
-    "Bengaluru":  (12.9716, 77.5946),
-    "Chennai":    (13.0827, 80.2707),
-    "Hyderabad":  (17.3850, 78.4867),
-    "Kolkata":    (22.5726, 88.3639),
-    "Pune":       (18.5204, 73.8567),
-    "Ahmedabad":  (23.0225, 72.5714),
-    "Jaipur":     (26.9124, 75.7873),
-    "Lucknow":    (26.8467, 80.9462),
-    "Chandigarh": (30.7333, 76.7794),
-    "Indore":     (22.7196, 75.8577),
-    "Bhopal":     (23.2599, 77.4126),
-    "Kochi":      (9.9312,  76.2673),
-    "Nagpur":     (21.1458, 79.0882),
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
 }
 
 
@@ -38,12 +29,12 @@ def ecomm_check(platform: str, city: str, brand_name: str) -> dict:
     Check if a brand's products are available on a platform in a given city.
 
     Args:
-        platform: One of "swiggy", "blinkit", "amazon"
-        city: Indian city name
+        platform:   One of "swiggy", "blinkit", "amazon"
+        city:       Indian city name
         brand_name: Food brand to search
 
     Returns:
-        dict with keys: found (bool), product_count (int), url (str)
+        dict with keys: found (bool), product_count (int), url (str), platform (str)
     """
     try:
         if platform == "swiggy":
@@ -59,55 +50,83 @@ def ecomm_check(platform: str, city: str, brand_name: str) -> dict:
 
 
 def _check_swiggy(city: str, brand_name: str) -> dict:
-    url = f"https://www.swiggy.com/search?query={brand_name.replace(' ', '+')}"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            geolocation={"latitude": CITY_COORDS.get(city, (19.07, 72.87))[0],
-                         "longitude": CITY_COORDS.get(city, (19.07, 72.87))[1]},
-            permissions=["geolocation"],
+    """Check Swiggy Instamart for brand availability (uses public search API)."""
+    url = f"https://www.swiggy.com/api/instamart/search?query={requests.utils.quote(brand_name)}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        data = resp.json()
+        # Swiggy Instamart API returns 'data' > 'products' list
+        products = (
+            data.get("data", {}).get("products", []) or
+            data.get("data", {}).get("cards", [])
         )
-        page = ctx.new_page()
-        page.goto(url, timeout=20000)
-        time.sleep(2)
-        items = page.query_selector_all(".store-card, [data-testid='store-card']")
-        count = len(items)
-        browser.close()
-        return {"found": count > 0, "product_count": count, "url": url, "platform": "swiggy"}
+        count = len(products)
+        return {
+            "found": count > 0,
+            "product_count": count,
+            "url": f"https://www.swiggy.com/instamart/search?query={brand_name}",
+            "platform": "swiggy",
+            "city": city,
+        }
+    except Exception as e:
+        # Fallback: scrape HTML search page
+        try:
+            page_url = f"https://www.swiggy.com/instamart/search?query={requests.utils.quote(brand_name)}"
+            r = requests.get(page_url, headers=HEADERS, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            items = soup.select("[data-testid='product-card'], .sc-aXZVg")
+            return {
+                "found": len(items) > 0,
+                "product_count": len(items),
+                "url": page_url,
+                "platform": "swiggy",
+                "city": city,
+            }
+        except Exception:
+            return {"found": False, "product_count": 0, "url": "", "platform": "swiggy", "error": str(e)}
 
 
 def _check_blinkit(city: str, brand_name: str) -> dict:
-    url = f"https://blinkit.com/s/?q={brand_name.replace(' ', '+')}"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            geolocation={"latitude": CITY_COORDS.get(city, (28.70, 77.10))[0],
-                         "longitude": CITY_COORDS.get(city, (28.70, 77.10))[1]},
-            permissions=["geolocation"],
-        )
-        page = ctx.new_page()
-        page.goto(url, timeout=20000)
-        time.sleep(2)
-        items = page.query_selector_all(".product-card")
+    """Check Blinkit for brand availability."""
+    url = f"https://blinkit.com/s/?q={requests.utils.quote(brand_name)}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Blinkit renders server-side product cards
+        items = soup.select(".product-card, [class*='Product__Container']")
         count = len(items)
-        browser.close()
-        return {"found": count > 0, "product_count": count, "url": url, "platform": "blinkit"}
+        return {
+            "found": count > 0,
+            "product_count": count,
+            "url": url,
+            "platform": "blinkit",
+            "city": city,
+        }
+    except Exception as e:
+        return {"found": False, "product_count": 0, "url": url, "platform": "blinkit", "error": str(e)}
 
 
 def _check_amazon(city: str, brand_name: str) -> dict:
-    url = f"https://www.amazon.in/s?k={brand_name.replace(' ', '+')}&i=grocery"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=20000)
-        items = page.query_selector_all("[data-component-type='s-search-result']")
+    """Check Amazon India grocery for brand availability."""
+    url = f"https://www.amazon.in/s?k={requests.utils.quote(brand_name)}&i=grocery"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.select("[data-component-type='s-search-result']")
         count = len(items)
-        browser.close()
-        return {"found": count > 0, "product_count": count, "url": url, "platform": "amazon"}
+        return {
+            "found": count > 0,
+            "product_count": count,
+            "url": url,
+            "platform": "amazon",
+            "city": city,
+        }
+    except Exception as e:
+        return {"found": False, "product_count": 0, "url": url, "platform": "amazon", "error": str(e)}
 
 
 def get_cities_list() -> list[str]:
-    """Returns the full list of cities to check."""
+    """Returns the full list of Indian cities to check."""
     return CITIES_TO_CHECK
 
 
