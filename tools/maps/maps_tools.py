@@ -18,8 +18,7 @@ try:
 except ImportError:
     HAS_PLAYWRIGHT = False
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-SERP_API_KEY        = os.getenv("SERP_API_KEY", "")
+# API keys are lazy-loaded inside each function so dotenv is always applied first
 
 MAJOR_CITIES = [
     "Mumbai", "Delhi", "Bengaluru", "Chennai", "Hyderabad",
@@ -45,22 +44,25 @@ def maps_search(query: str, city: str) -> list[dict]:
     """
     full_query = f"{query} {city} India"
 
-    if SERP_API_KEY:
-        results = _serp_maps_search(full_query, city)
-        if results:
+    # Lazy-load keys every call so dotenv changes are picked up
+    serp_key = os.getenv("SERP_API_KEY", "").strip()
+
+    if serp_key:
+        results = _serp_maps_search(full_query, city, serp_key)
+        if results and not all("error" in r for r in results):
             return results
 
     if HAS_PLAYWRIGHT:
         return _playwright_maps_search(full_query, city)
 
-    return [{"error": "no search method available (set SERP_API_KEY for reliable results)", "city": city}]
+    return [{"error": "no search method available — set SERP_API_KEY in .env", "city": city}]
 
 
-def _serp_maps_search(query: str, city: str) -> list[dict]:
+def _serp_maps_search(query: str, city: str, serp_key: str) -> list[dict]:
     try:
         resp = requests.get(
             "https://serpapi.com/search",
-            params={"q": query, "engine": "google_maps", "api_key": SERP_API_KEY},
+            params={"q": query, "engine": "google_maps", "api_key": serp_key},
             timeout=15,
         )
         data = resp.json()
