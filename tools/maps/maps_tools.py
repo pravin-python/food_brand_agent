@@ -1,49 +1,62 @@
 """
 tools/maps/maps_tools.py
 Google Maps, Justdial, IndiaMart tools for the Web & Maps Agent.
-Uses SerpAPI (if key set) or DuckDuckGo/requests fallback — no sync_playwright.
+
+Priority order:
+  1. SerpAPI (reliable, needs SERP_API_KEY env var)
+  2. Playwright-based Google Maps scraping (fragile, no key needed)
+  3. Requests + BeautifulSoup for Justdial / IndiaMart
 """
 
 import os
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 SERP_API_KEY        = os.getenv("SERP_API_KEY", "")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+MAJOR_CITIES = [
+    "Mumbai", "Delhi", "Bengaluru", "Chennai", "Hyderabad",
+    "Kolkata", "Pune", "Ahmedabad", "Jaipur", "Lucknow",
+    "Surat", "Nagpur", "Indore", "Bhopal", "Kochi",
+]
 
 
 def maps_search(query: str, city: str) -> list[dict]:
     """
     Search Google Maps for a query in a specific Indian city.
-    Uses SerpAPI if key is set, else Google Places API, else DuckDuckGo fallback.
+
+    Uses SerpAPI if SERP_API_KEY is set, otherwise falls back to
+    Playwright-based scraping of Google Maps.
 
     Args:
-        query: e.g. "AMUL distributor"
-        city:  Indian city name
+        query: Search query, e.g. "AMUL distributor".
+        city:  Indian city name.
 
     Returns:
-        List of business location dicts
+        List of business location dicts with: name, address, city, state,
+        phone, rating, source, verified.
     """
     full_query = f"{query} {city} India"
 
     if SERP_API_KEY:
-        return _serp_maps_search(full_query, city)
-    elif GOOGLE_MAPS_API_KEY:
-        return _google_places_search(full_query, city)
-    else:
-        return _duckduckgo_search(full_query, city)
+        results = _serp_maps_search(full_query, city)
+        if results:
+            return results
+
+    if HAS_PLAYWRIGHT:
+        return _playwright_maps_search(full_query, city)
+
+    return [{"error": "no search method available (set SERP_API_KEY for reliable results)", "city": city}]
 
 
 def _serp_maps_search(query: str, city: str) -> list[dict]:
-    """Use SerpAPI Google Maps engine."""
     try:
         resp = requests.get(
             "https://serpapi.com/search",
@@ -53,118 +66,149 @@ def _serp_maps_search(query: str, city: str) -> list[dict]:
         data = resp.json()
         results = []
         for place in data.get("local_results", []):
-            address = place.get("address", "")
+            addr = place.get("address", "")
+            parts = [p.strip() for p in addr.split(",")]
             results.append({
                 "name":     place.get("title", ""),
-                "address":  address,
-                "city":     city,
-                "state":    address.split(",")[-1].strip() if "," in address else "",
+                "address":  addr,
+                "city":     parts[-2] if len(parts) >= 2 else city,
+                "state":    parts[-1] if parts else "",
                 "phone":    place.get("phone", ""),
                 "rating":   place.get("rating", 0),
-                "source":   "google_maps",
+                "source":   "google_maps_serp",
                 "verified": True,
             })
         return results
-    except Exception as e:
-        return [{"error": str(e), "source": "serpapi"}]
+    except Exception as exc:
+        return [{"error": str(exc), "source": "serp", "city": city}]
 
 
-def _google_places_search(query: str, city: str) -> list[dict]:
-    """Use Google Places Text Search API."""
+def _playwright_maps_search(query: str, city: str) -> list[dict]:
+    results = []
     try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/place/textsearch/json",
-            params={"query": query, "region": "in", "key": GOOGLE_MAPS_API_KEY},
-            timeout=15,
-        )
-        data = resp.json()
-        results = []
-        for place in data.get("results", [])[:10]:
-            address = place.get("formatted_address", "")
-            results.append({
-                "name":     place.get("name", ""),
-                "address":  address,
-                "city":     city,
-                "state":    address.split(",")[-2].strip() if "," in address else "",
-                "rating":   place.get("rating", 0),
-                "source":   "google_places",
-                "verified": True,
-            })
-        return results
-    except Exception as e:
-        return [{"error": str(e), "source": "google_places"}]
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+                )
+            )
+            maps_url = (
+                "https://www.google.com/maps/search/"
+                + query.replace(" ", "+")
+            )
+            page.goto(maps_url, timeout=25_000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
 
+            # Google Maps renders results in a feed panel
+            card_selectors = [
+                '[data-result-index]',
+                '[jstcache]',
+                '.Nv2PK',
+                '[class*="result"]',
+            ]
+            cards = []
+            for sel in card_selectors:
+                cards = page.query_selector_all(sel)
+                if cards:
+                    break
 
-def _duckduckgo_search(query: str, city: str) -> list[dict]:
-    """Fallback: DuckDuckGo instant answer API for location results."""
-    try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1},
-            headers=HEADERS,
-            timeout=10,
-        )
-        data = resp.json()
-        results = []
-        for r in data.get("RelatedTopics", [])[:10]:
-            text = r.get("Text", "")
-            if text:
-                results.append({
-                    "name":     text.split(" - ")[0] if " - " in text else text[:60],
-                    "address":  text,
-                    "city":     city,
-                    "state":    "",
-                    "source":   "duckduckgo",
-                    "verified": False,
-                })
-        return results
-    except Exception as e:
-        return [{"error": str(e), "source": "duckduckgo"}]
+            for card in cards[:10]:
+                name_el = card.query_selector('.qBF1Pd, [class*="fontHeadlineSmall"]')
+                addr_el = card.query_selector('.W4Efsd:last-child, [class*="fontBodyMedium"]')
+                name    = name_el.inner_text() if name_el else ""
+                address = addr_el.inner_text() if addr_el else ""
+                parts   = [p.strip() for p in address.split(",")]
+
+                if name:
+                    results.append({
+                        "name":     name,
+                        "address":  address,
+                        "city":     parts[-2] if len(parts) >= 2 else city,
+                        "state":    parts[-1] if parts else "",
+                        "phone":    "",
+                        "rating":   0,
+                        "source":   "google_maps_playwright",
+                        "verified": False,
+                    })
+
+            browser.close()
+    except Exception as exc:
+        results.append({"error": str(exc), "source": "google_maps_playwright", "city": city})
+    return results
 
 
 def justdial_search(brand: str, city: str) -> list[dict]:
     """
-    Search Justdial for brand dealers/distributors in a city.
+    Search Justdial for brand dealers/distributors in an Indian city.
 
     Args:
-        brand: Brand name
-        city:  Indian city
+        brand: Brand name.
+        city:  Indian city.
 
     Returns:
-        List of dealer dicts
+        List of dealer dicts with: name, address, city, phone, source.
     """
     results = []
     city_slug  = city.lower().replace(" ", "-")
     brand_slug = brand.lower().replace(" ", "-")
-    url = f"https://www.justdial.com/{city_slug}/{brand_slug}-dealers"
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
+    # Try multiple URL patterns Justdial uses
+    urls = [
+        f"https://www.justdial.com/{city_slug}/{brand_slug}-dealers",
+        f"https://www.justdial.com/{city_slug}/{brand_slug}-distributors",
+        f"https://www.justdial.com/{city_slug}/{brand_slug}",
+    ]
 
-        # Try multiple known Justdial selectors
-        listings = (
-            soup.select(".resultbox_info") or
-            soup.select(".store-details") or
-            soup.select(".jsx-3529314109")
-        )
+    for url in urls:
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-IN,en;q=0.9",
+                    "Referer": "https://www.justdial.com/",
+                },
+                timeout=15,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        for listing in listings[:15]:
-            name_el = listing.select_one(".store_name, h2, .resultbox_title_anchor")
-            addr_el = listing.select_one(".address-info, .jd-address, .resultbox_address")
-            name    = name_el.get_text(strip=True) if name_el else ""
-            address = addr_el.get_text(strip=True) if addr_el else ""
-            if name:
-                results.append({
-                    "name":     name,
-                    "address":  address,
-                    "city":     city,
-                    "state":    "",
-                    "source":   "justdial",
-                    "verified": False,
-                })
-    except Exception as e:
-        results.append({"error": str(e), "source": "justdial"})
+            # Justdial uses several different class names across page versions
+            listings = soup.select(
+                ".resultbox_info, .store-details, "
+                "[class*='resultbox'], [class*='jsx-'], "
+                ".jdoRest, .cntanr"
+            )
+
+            for listing in listings[:15]:
+                name_el  = listing.select_one(".store_name, h2, h3, [class*='name']")
+                addr_el  = listing.select_one(".address-info, .jd-address, [class*='address']")
+                phone_el = listing.select_one(".contact-info, [class*='phone'], [class*='tel']")
+
+                name  = name_el.get_text(strip=True)  if name_el  else ""
+                addr  = addr_el.get_text(strip=True)  if addr_el  else ""
+                phone = phone_el.get_text(strip=True) if phone_el else ""
+
+                if name:
+                    results.append({
+                        "name":    name,
+                        "address": addr,
+                        "city":    city,
+                        "state":   "",
+                        "phone":   phone,
+                        "source":  "justdial",
+                        "verified": False,
+                    })
+
+            if results:
+                break  # stop trying URLs once we have results
+
+        except Exception as exc:
+            results.append({"error": str(exc), "source": "justdial", "city": city})
 
     return results
 
@@ -174,42 +218,70 @@ def indiamart_search(brand: str) -> list[dict]:
     Search IndiaMart for wholesale distributors/suppliers of a brand across India.
 
     Args:
-        brand: Brand name
+        brand: Brand name.
 
     Returns:
-        List of supplier location dicts
+        List of supplier location dicts with: name, city, state, source.
     """
     results = []
-    url = f"https://www.indiamart.com/search.mp?ss={requests.utils.quote(brand)}&categ=food"
+    urls = [
+        f"https://www.indiamart.com/search.mp?ss={_enc(brand)}&categ=food",
+        f"https://www.indiamart.com/proddetail/{_enc(brand.lower())}.html",
+    ]
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
+    for url in urls:
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-IN,en;q=0.9",
+                },
+                timeout=15,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try multiple known IndiaMart selectors
-        cards = (
-            soup.select(".imb-bx") or
-            soup.select(".supplier-card") or
-            soup.select(".listing-card")
-        )
+            cards = soup.select(
+                ".imb-bx, .supplier-card, "
+                "[class*='supplier'], [class*='seller'], "
+                ".bx-sl, .prd-detail"
+            )
 
-        for card in cards[:20]:
-            name_el  = card.select_one(".imb_bname, .supplier-name, .lc-name")
-            city_el  = card.select_one(".imb_city, .city, .lc-city")
-            state_el = card.select_one(".imb_state, .state, .lc-state")
+            for card in cards[:20]:
+                name_el  = card.select_one("[class*='bname'], [class*='name'], h3, h4")
+                city_el  = card.select_one("[class*='city'], [class*='location']")
+                state_el = card.select_one("[class*='state']")
 
-            results.append({
-                "name":    name_el.get_text(strip=True)  if name_el  else "",
-                "city":    city_el.get_text(strip=True)  if city_el  else "",
-                "state":   state_el.get_text(strip=True) if state_el else "",
-                "source":  "indiamart",
-                "verified": False,
-            })
-    except Exception as e:
-        results.append({"error": str(e), "source": "indiamart"})
+                name  = name_el.get_text(strip=True)  if name_el  else ""
+                city  = city_el.get_text(strip=True)  if city_el  else ""
+                state = state_el.get_text(strip=True) if state_el else ""
+
+                if name:
+                    results.append({
+                        "name":    name,
+                        "city":    city,
+                        "state":   state,
+                        "source":  "indiamart",
+                        "verified": False,
+                    })
+
+            if results:
+                break
+
+        except Exception as exc:
+            results.append({"error": str(exc), "source": "indiamart"})
 
     return results
 
 
-# ---- Register tools list for DeepAgent ----
+# ─── Helper ───────────────────────────────────────────────────────────────────
+
+def _enc(text: str) -> str:
+    return text.replace(" ", "+")
+
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
 MAPS_TOOLS = [maps_search, justdial_search, indiamart_search]
